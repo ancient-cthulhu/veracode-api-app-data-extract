@@ -44,14 +44,21 @@ from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
 API_BASE = os.environ.get("VERACODE_API_BASE", "https://api.veracode.com")
 TIMEOUT = (5, 90)
 
-# HMAC-authenticated session
+SCAN_MAP = {
+    "sast": "STATIC",
+    "dast": "DYNAMIC",
+    "mpt":  "MANUAL",
+    "sca":  "SCA",
+}
+
+# HMAC session
 def make_session():
     s = requests.Session()
     s.auth = RequestsAuthPluginVeracodeHMAC()
     s.headers.update({"Accept": "application/json"})
     return s
 
-# Iterate HAL pages
+# HAL pagination
 def walk_pages(session, url, params=None, debug=False):
     next_url, first = url, True
     while next_url:
@@ -76,7 +83,7 @@ def parse_when(value):
             pass
     return None
 
-# Filters
+# filters
 def is_open_finding(item):
     status = (
         (item.get("finding_status") or {}).get("status")
@@ -109,7 +116,7 @@ def severity_level(item):
     except Exception:
         return None
 
-# Policy lookups
+# policy lookups
 def get_policy_name(session, policy_guid, debug=False):
     if not policy_guid:
         return ""
@@ -137,7 +144,7 @@ def get_policy_from_summary(session, app_guid, debug=False):
             name = get_policy_name(session, pg, debug=debug)
     return name, status
 
-# App list
+# app list
 def fetch_applications(debug=False):
     apps = {}
     with make_session() as s:
@@ -153,7 +160,7 @@ def fetch_applications(debug=False):
                     print(f"[DEBUG] APP {guid} name='{name}' compliance='{compliance}' policy_guid='{policy_guid}'")
     return apps
 
-# Count open, non-sandbox findings by severity for a given scan_type
+# count findings for one scan type
 def count_by_scan_type(session, app_guid, scan_type, since=None, debug=False):
     counts = {"Very High": 0, "High": 0, "Medium": 0, "Low": 0}
     url = f"{API_BASE}/appsec/v2/applications/{app_guid}/findings"
@@ -179,13 +186,12 @@ def count_by_scan_type(session, app_guid, scan_type, since=None, debug=False):
         print(f"[DEBUG] {app_guid} scan_type={scan_type} counts={counts}")
     return counts
 
-# Sum dict B into A (keys: VH/H/M/L)
 def add_counts(a, b):
     for k in a.keys():
         a[k] += b.get(k, 0)
 
-# Per-app worker: sum STATIC + DYNAMIC + MANUAL + SCA
-def build_row(app_guid, app_meta, since=None, debug=False):
+# per-app worker: sum selected scan types
+def build_row(app_guid, app_meta, scan_types, since=None, debug=False):
     with make_session() as s:
         policy_name = ""
         compliance = app_meta.get("compliance") or ""
@@ -200,9 +206,8 @@ def build_row(app_guid, app_meta, since=None, debug=False):
         compliance = (compliance or "NOT_ASSESSED").upper()
 
         total = {"Very High": 0, "High": 0, "Medium": 0, "Low": 0}
-        # Findings API cannot combine types; aggregate client-side
-        for t in ("STATIC", "DYNAMIC", "MANUAL", "SCA"):
-            add_counts(total, count_by_scan_type(s, app_guid, t, since=since, debug=debug))
+        for st in scan_types:
+            add_counts(total, count_by_scan_type(s, app_guid, st, since=since, debug=debug))
 
         if debug:
             print(f"[DEBUG] {app_guid} policy='{policy_name}' compliance='{compliance}' total={total}")
@@ -234,9 +239,9 @@ def write_json(rows, path):
     print(f"Wrote: {path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Veracode findings export (totals across STATIC/DYNAMIC/MANUAL/SCA)")
+    parser = argparse.ArgumentParser(description="Veracode findings export (select SAST/SCA/DAST/MPT; totals by severity)")
     parser.add_argument("--format", choices=["csv", "json"], default="csv",
-                        help="Output format (csv|json). Default: csv")
+                        help="Output format. Default: csv")
     parser.add_argument("--out", default="./export/veracode_findings.csv",
                         help="Output file path. Default: ./export/veracode_findings.csv")
     parser.add_argument("--start-date", default=None,
@@ -246,15 +251,22 @@ def main():
                         help="Parallel workers. Default: 8")
     parser.add_argument("--debug", action="store_true",
                         help="Print debug logs")
+    parser.add_argument("--scans", nargs="+",
+                        choices=["sast", "sca", "dast", "mpt"],
+                        default=["sast", "sca", "dast", "mpt"],
+                        help="One or more: sast sca dast mpt. Default: all.")
     args = parser.parse_args()
 
+    selected_scan_types = [SCAN_MAP[x] for x in args.scans] or [SCAN_MAP[k] for k in ("sast","sca","dast","mpt")]
     since = parse_when(args.start_date) if args.start_date else None
     apps = fetch_applications(debug=args.debug)
 
     rows = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        fut_to_guid = {pool.submit(build_row, guid, meta, since, args.debug): guid
-                       for guid, meta in apps.items()}
+        fut_to_guid = {
+            pool.submit(build_row, guid, meta, selected_scan_types, since, args.debug): guid
+            for guid, meta in apps.items()
+        }
         for fut in as_completed(fut_to_guid):
             guid = fut_to_guid[fut]
             try:
