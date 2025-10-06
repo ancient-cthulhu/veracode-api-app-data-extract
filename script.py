@@ -41,45 +41,43 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
 
-BASE = os.environ.get("VERACODE_API_BASE", "https://api.veracode.com")
+API_BASE = os.environ.get("VERACODE_API_BASE", "https://api.veracode.com")
 TIMEOUT = (5, 90)
 
-# new session with HMAC auth
-def new_session():
+# HMAC-authenticated session
+def make_session():
     s = requests.Session()
     s.auth = RequestsAuthPluginVeracodeHMAC()
     s.headers.update({"Accept": "application/json"})
     return s
 
-# follow pagination links
-def paginate(session, url, params=None, debug=False):
-    next_url = url
-    first = True
+# Iterate HAL pages
+def walk_pages(session, url, params=None, debug=False):
+    next_url, first = url, True
     while next_url:
-        r = session.get(next_url, params=params if first else None, timeout=TIMEOUT)
+        resp = session.get(next_url, params=params if first else None, timeout=TIMEOUT)
         if debug:
-            print(f"[DEBUG] GET {r.request.url} -> {r.status_code}")
-        r.raise_for_status()
-        data = r.json()
+            print(f"[DEBUG] GET {resp.request.url} -> {resp.status_code}")
+        resp.raise_for_status()
+        data = resp.json()
         yield data
         href = (data.get("_links") or {}).get("next", {}).get("href")
-        next_url = urljoin(BASE, href) if href else None
+        next_url = urljoin(API_BASE, href) if href else None
         first = False
 
-# parse iso date strings
-def parse_datetime(value):
+def parse_when(value):
     if not value:
         return None
-    trimmed = value.replace("T", " ").replace("Z", "").split(".")[0]
+    txt = value.replace("T", " ").replace("Z", "").split(".")[0]
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
-            return dt.datetime.strptime(trimmed, fmt)
+            return dt.datetime.strptime(txt, fmt)
         except Exception:
             pass
     return None
 
-# findings filters
-def finding_is_open(item):
+# Filters
+def is_open_finding(item):
     status = (
         (item.get("finding_status") or {}).get("status")
         or item.get("status")
@@ -88,22 +86,22 @@ def finding_is_open(item):
     )
     return str(status).upper() == "OPEN"
 
-def finding_is_sandbox(item):
-    context = item.get("context") or {}
-    if str(context.get("type") or "").upper() == "SANDBOX":
+def is_sandbox_finding(item):
+    ctx = item.get("context") or {}
+    if str(ctx.get("type") or "").upper() == "SANDBOX":
         return True
     details = item.get("finding_details") or {}
     return bool(item.get("sandbox_id") or details.get("sandbox_id"))
 
-def finding_first_seen(item):
+def first_seen(item):
     details = item.get("finding_details") or {}
     ts = (
         item.get("first_found_date") or item.get("first_seen_date") or item.get("published_date")
         or details.get("first_found_date") or details.get("first_seen_date") or details.get("published_date")
     )
-    return parse_datetime(ts)
+    return parse_when(ts)
 
-def finding_severity(item):
+def severity_level(item):
     details = item.get("finding_details") or {}
     sev = details.get("severity", item.get("severity"))
     try:
@@ -111,11 +109,11 @@ def finding_severity(item):
     except Exception:
         return None
 
-# resolve policy guid -> name
-def fetch_policy_name(session, policy_guid, debug=False):
+# Policy lookups
+def get_policy_name(session, policy_guid, debug=False):
     if not policy_guid:
         return ""
-    url = f"{BASE}/appsec/v1/policies/{policy_guid}"
+    url = f"{API_BASE}/appsec/v1/policies/{policy_guid}"
     r = session.get(url, timeout=TIMEOUT)
     if debug:
         print(f"[DEBUG] GET {url} -> {r.status_code}")
@@ -123,105 +121,108 @@ def fetch_policy_name(session, policy_guid, debug=False):
         return ""
     return (r.json() or {}).get("policy_name") or ""
 
-# fallback summary report
-def fetch_policy_from_summary(session, app_guid, debug=False):
-    url = f"{BASE}/appsec/v2/applications/{app_guid}/summary_report"
+def get_policy_from_summary(session, app_guid, debug=False):
+    url = f"{API_BASE}/appsec/v2/applications/{app_guid}/summary_report"
     r = session.get(url, timeout=TIMEOUT)
     if debug:
         print(f"[DEBUG] GET {url} -> {r.status_code}")
     if r.status_code != 200:
         return "", None
-    data = r.json() or {}
-    policy_name = (
-        data.get("policy_name")
-        or (data.get("policy") or {}).get("policy_name")
-        or ""
-    )
-    compliance = (
-        data.get("policy_compliance_status")
-        or (data.get("policy") or {}).get("compliance_status")
-        or None
-    )
-    if not policy_name:
-        pg = data.get("policy_guid") or (data.get("policy") or {}).get("policy_guid")
+    body = r.json() or {}
+    name = body.get("policy_name") or (body.get("policy") or {}).get("policy_name") or ""
+    status = body.get("policy_compliance_status") or (body.get("policy") or {}).get("compliance_status") or None
+    if not name:
+        pg = body.get("policy_guid") or (body.get("policy") or {}).get("policy_guid")
         if pg:
-            policy_name = fetch_policy_name(session, pg, debug=debug)
-    return policy_name, compliance
+            name = get_policy_name(session, pg, debug=debug)
+    return name, status
 
-# list apps
-def list_applications(debug=False):
+# App list
+def fetch_applications(debug=False):
     apps = {}
-    with new_session() as s:
-        url = f"{BASE}/appsec/v1/applications"
-        for page in paginate(s, url, params={"size": 500}, debug=debug):
+    with make_session() as s:
+        url = f"{API_BASE}/appsec/v1/applications"
+        for page in walk_pages(s, url, params={"size": 500}, debug=debug):
             for app in (page.get("_embedded") or {}).get("applications", []):
                 guid = app.get("guid")
                 name = (app.get("profile") or {}).get("name") or ""
                 compliance = app.get("policy_compliance") or ""
                 policy_guid = (app.get("policy") or {}).get("policy_guid") or ""
-                apps[guid] = {
-                    "name": name,
-                    "policy_compliance": compliance,
-                    "policy_guid": policy_guid,
-                }
+                apps[guid] = {"name": name, "compliance": compliance, "policy_guid": policy_guid}
                 if debug:
                     print(f"[DEBUG] APP {guid} name='{name}' compliance='{compliance}' policy_guid='{policy_guid}'")
     return apps
 
-# worker: resolve policy + count findings
-def process_app(guid, base_meta, start_from=None, debug=False):
-    with new_session() as s:
+# Count open, non-sandbox findings by severity for a given scan_type
+def count_by_scan_type(session, app_guid, scan_type, since=None, debug=False):
+    counts = {"Very High": 0, "High": 0, "Medium": 0, "Low": 0}
+    url = f"{API_BASE}/appsec/v2/applications/{app_guid}/findings"
+    params = {"size": 500, "scan_type": scan_type}
+    for page in walk_pages(session, url, params=params, debug=debug):
+        for f in (page.get("_embedded") or {}).get("findings", []) or []:
+            if not is_open_finding(f) or is_sandbox_finding(f):
+                continue
+            if since:
+                when = first_seen(f)
+                if when and when < since:
+                    continue
+            sev = severity_level(f)
+            if sev == 5:
+                counts["Very High"] += 1
+            elif sev == 4:
+                counts["High"] += 1
+            elif sev == 3:
+                counts["Medium"] += 1
+            elif sev in (1, 2):
+                counts["Low"] += 1
+    if debug:
+        print(f"[DEBUG] {app_guid} scan_type={scan_type} counts={counts}")
+    return counts
+
+# Sum dict B into A (keys: VH/H/M/L)
+def add_counts(a, b):
+    for k in a.keys():
+        a[k] += b.get(k, 0)
+
+# Per-app worker: sum STATIC + DYNAMIC + MANUAL + SCA
+def build_row(app_guid, app_meta, since=None, debug=False):
+    with make_session() as s:
         policy_name = ""
-        compliance = base_meta.get("policy_compliance") or ""
-        pg = base_meta.get("policy_guid") or ""
-        if pg:
-            policy_name = fetch_policy_name(s, pg, debug=debug)
+        compliance = app_meta.get("compliance") or ""
+        policy_guid = app_meta.get("policy_guid") or ""
+
+        if policy_guid:
+            policy_name = get_policy_name(s, policy_guid, debug=debug)
         if not policy_name or not compliance:
-            sr_name, sr_comp = fetch_policy_from_summary(s, guid, debug=debug)
+            sr_name, sr_status = get_policy_from_summary(s, app_guid, debug=debug)
             policy_name = policy_name or sr_name or ""
-            compliance = compliance or (sr_comp or "")
+            compliance = compliance or (sr_status or "")
         compliance = (compliance or "NOT_ASSESSED").upper()
 
-        url = f"{BASE}/appsec/v2/applications/{guid}/findings"
-        counts = {"Very High": 0, "High": 0, "Medium": 0, "Low": 0}
-        for page in paginate(s, url, params={"size": 500}, debug=debug):
-            items = (page.get("_embedded") or {}).get("findings", []) or []
-            for f in items:
-                if not finding_is_open(f) or finding_is_sandbox(f):
-                    continue
-                if start_from:
-                    ts = finding_first_seen(f)
-                    if ts and ts < start_from:
-                        continue
-                sev = finding_severity(f)
-                if sev == 5:
-                    counts["Very High"] += 1
-                elif sev == 4:
-                    counts["High"] += 1
-                elif sev == 3:
-                    counts["Medium"] += 1
-                elif sev in (1, 2):
-                    counts["Low"] += 1
+        total = {"Very High": 0, "High": 0, "Medium": 0, "Low": 0}
+        # Findings API cannot combine types; aggregate client-side
+        for t in ("STATIC", "DYNAMIC", "MANUAL", "SCA"):
+            add_counts(total, count_by_scan_type(s, app_guid, t, since=since, debug=debug))
 
         if debug:
-            print(f"[DEBUG] {guid} policy='{policy_name}' compliance='{compliance}' counts={counts}")
+            print(f"[DEBUG] {app_guid} policy='{policy_name}' compliance='{compliance}' total={total}")
 
         return {
-            "Application Name": base_meta.get("name") or f"(GUID:{guid})",
+            "Application Name": app_meta.get("name") or f"(GUID:{app_guid})",
             "Application Passed Policy": compliance,
             "Current Policy": policy_name,
-            "Very High": counts["Very High"],
-            "High": counts["High"],
-            "Medium": counts["Medium"],
-            "Low": counts["Low"],
+            "Very High": total["Very High"],
+            "High": total["High"],
+            "Medium": total["Medium"],
+            "Low": total["Low"],
         }
 
-# csv/json writers
 def write_csv(rows, path):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fields = ["Application Name", "Application Passed Policy", "Current Policy", "Very High", "High", "Medium", "Low"]
+    headers = ["Application Name", "Application Passed Policy", "Current Policy",
+               "Very High", "High", "Medium", "Low"]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=headers)
         w.writeheader()
         w.writerows(rows)
     print(f"Wrote: {path}")
@@ -232,44 +233,46 @@ def write_json(rows, path):
         json.dump(rows, f, ensure_ascii=False, indent=2)
     print(f"Wrote: {path}")
 
-# main
 def main():
-    ap = argparse.ArgumentParser(description="Veracode Data Export.")
-    ap.add_argument("--format", choices=["csv", "json"], default="csv",
-                    help="Output format (csv or json). Default: csv")
-    ap.add_argument("--out", default="./export/veracode_applications.csv",
-                    help="Output file path. Default: ./export/veracode_applications.csv")
-    ap.add_argument("--start-date", default=None,
-                    help="Only include findings first seen on/after this date (YYYY-MM-DD).")
-    ap.add_argument("--workers", type=int, default=8,
-                    help="Parallel workers (threads). Default: 8. Increase for speed, decrease if throttled.")
-    ap.add_argument("--debug", action="store_true",
-                    help="Enable debug logging (prints requests + samples).")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Veracode findings export (totals across STATIC/DYNAMIC/MANUAL/SCA)")
+    parser.add_argument("--format", choices=["csv", "json"], default="csv",
+                        help="Output format (csv|json). Default: csv")
+    parser.add_argument("--out", default="./export/veracode_findings.csv",
+                        help="Output file path. Default: ./export/veracode_findings.csv")
+    parser.add_argument("--start-date", default=None,
+                        help="Only include findings first seen on/after this timestamp "
+                             "(YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS').")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Parallel workers. Default: 8")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print debug logs")
+    args = parser.parse_args()
 
-    start_from = parse_datetime(args.start_date) if args.start_date else None
-
-    base_apps = list_applications(debug=args.debug)
+    since = parse_when(args.start_date) if args.start_date else None
+    apps = fetch_applications(debug=args.debug)
 
     rows = []
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = {ex.submit(process_app, guid, meta, start_from, args.debug): guid for guid, meta in base_apps.items()}
-        for fut in as_completed(futures):
-            guid = futures[fut]
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        fut_to_guid = {pool.submit(build_row, guid, meta, since, args.debug): guid
+                       for guid, meta in apps.items()}
+        for fut in as_completed(fut_to_guid):
+            guid = fut_to_guid[fut]
             try:
                 rows.append(fut.result())
-            except Exception as e:
+            except Exception as exc:
                 if args.debug:
-                    print(f"[DEBUG] ERROR {guid}: {e}")
+                    print(f"[DEBUG] ERROR {guid}: {exc}")
 
     if args.format == "json":
-        write_json(rows, args.out)
+        out_path = args.out
+        if out_path.endswith("/") or out_path.endswith("\\"):
+            out_path = os.path.join(out_path, "veracode_findings.json")
+        write_json(rows, out_path)
     else:
-        out = args.out
-        if out.endswith("/") or out.endswith("\\"):
-            out = os.path.join(out, "veracode_dashboard.csv")
-        write_csv(rows, out)
+        out_path = args.out
+        if out_path.endswith("/") or out_path.endswith("\\"):
+            out_path = os.path.join(out_path, "veracode_findings.csv")
+        write_csv(rows, out_path)
 
 if __name__ == "__main__":
-
     main()
